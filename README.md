@@ -1,10 +1,12 @@
 # Home Assistant AddOn Modbus Proxy
  
-Usally one modbus server only allows a single connection and denies any more clients. 
-With this Addon you can create a proxy which can handle mutiple client connections at the same time. 
+Usually one modbus server only allows a single connection and denies any more clients. 
+With this Addon you can create a proxy which can handle multiple client connections at the same time. 
 Currently you can configure the Addon to establish a connection to three different Modbus Servers and provide the information to multiple clients through the respective listenport.
 
-The addon is only tested and compatible with hassio supervisor. 
+The addon is only tested and compatible with hassio supervisor.
+
+**Note**: This version includes fixes for IncompleteReadError issues that commonly occur with SMA devices and other Modbus devices that may send shorter responses than expected. 
 
 ## Installation
 [![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FTCzerny%2Fha-modbusproxy)

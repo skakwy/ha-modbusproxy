@@ -93,9 +93,30 @@ class Connection:
     async def _read(self):
         """Read ModBus TCP message"""
         # TODO: Handle Modbus RTU and ASCII
-        header = await self.reader.readexactly(6)
+        try:
+            header = await self.reader.readexactly(6)
+        except asyncio.IncompleteReadError as error:
+            self.log.error("Failed to read Modbus header: %r", error)
+            raise
+        except Exception as error:
+            self.log.error("Error reading Modbus header: %r", error)
+            raise
+            
         size = int.from_bytes(header[4:], "big")
-        reply = header + await self.reader.readexactly(size)
+        # Size field includes unit identifier and function code onwards,
+        # but excludes the 6-byte MBAP header, so we need to read (size) more bytes
+        if size > 0:
+            # Add additional safety check for reasonable message size
+            if size > 255:  # Modbus messages are typically much smaller
+                self.log.warning("Unusually large Modbus message size: %d bytes", size)
+            try:
+                payload = await self.reader.readexactly(size)
+                reply = header + payload
+            except asyncio.IncompleteReadError as error:
+                self.log.error("Failed to read Modbus payload of %d bytes: %r", size, error)
+                raise
+        else:
+            reply = header
         self.log.debug("received %r", reply)
         return reply
 
@@ -104,7 +125,10 @@ class Connection:
             return await self._read()
         except asyncio.IncompleteReadError as error:
             if error.partial:
-                self.log.error("reading error: %r", error)
+                self.log.error("reading error - incomplete read: %r (got %d bytes, expected %d)", 
+                              error, len(error.partial), error.expected)
+                # Log the partial data for debugging
+                self.log.debug("partial data received: %r", error.partial)
             else:
                 self.log.info("client closed connection")
             await self.close()
@@ -160,12 +184,30 @@ class ModBus(Connection):
                 try:
                     await self.connect()
                     coro = self._write_read(data)
-                    return await asyncio.wait_for(coro, self.timeout)
+                    result = await asyncio.wait_for(coro, self.timeout)
+                    return result
+                except asyncio.IncompleteReadError as error:
+                    self.log.error(
+                        "write_read incomplete read error [%s/%s]: %r (got %d bytes, expected %d)", 
+                        i + 1, attempts, error, len(error.partial) if error.partial else 0, error.expected
+                    )
+                    await self.close()
+                    if i == attempts - 1:  # Last attempt
+                        raise
+                except asyncio.TimeoutError as error:
+                    self.log.error(
+                        "write_read timeout error [%s/%s]: %r", i + 1, attempts, error
+                    )
+                    await self.close()
+                    if i == attempts - 1:  # Last attempt
+                        raise
                 except Exception as error:
                     self.log.error(
                         "write_read error [%s/%s]: %r", i + 1, attempts, error
                     )
                     await self.close()
+                    if i == attempts - 1:  # Last attempt
+                        raise
 
     async def _write_read(self, data):
         await self._write(data)

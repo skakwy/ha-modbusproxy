@@ -95,6 +95,7 @@ class Connection:
         # TODO: Handle Modbus RTU and ASCII
         try:
             header = await self.reader.readexactly(6)
+            self.log.debug("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
         except asyncio.IncompleteReadError as error:
             self.log.error("Failed to read Modbus header: %r", error)
             raise
@@ -102,22 +103,45 @@ class Connection:
             self.log.error("Error reading Modbus header: %r", error)
             raise
             
-        size = int.from_bytes(header[4:], "big")
+        # Modbus TCP header structure:
+        # Byte 0-1: Transaction ID
+        # Byte 2-3: Protocol ID (should be 0)  
+        # Byte 4-5: Length field (number of bytes following)
+        transaction_id = int.from_bytes(header[0:2], "big")
+        protocol_id = int.from_bytes(header[2:4], "big") 
+        size = int.from_bytes(header[4:6], "big")
+        
+        self.log.debug("Modbus header - Transaction ID: %d, Protocol ID: %d, Length: %d", 
+                      transaction_id, protocol_id, size)
+        
+        # Validate the header looks reasonable
+        if protocol_id != 0:
+            self.log.warning("Unexpected protocol ID: %d (should be 0)", protocol_id)
+            
         # Size field includes unit identifier and function code onwards,
         # but excludes the 6-byte MBAP header, so we need to read (size) more bytes
         if size > 0:
             # Add additional safety check for reasonable message size
-            if size > 255:  # Modbus messages are typically much smaller
-                self.log.warning("Unusually large Modbus message size: %d bytes", size)
+            # Modbus messages should not exceed 260 bytes (Modbus specification limit)
+            if size > 260:  
+                self.log.error("Modbus message size too large: %d bytes. Full header: %r", size, header)
+                self.log.error("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
+                # This indicates stream corruption or misalignment - close connection
+                raise ValueError(f"Modbus message size exceeds specification limit: {size} bytes")
+                
             try:
                 payload = await self.reader.readexactly(size)
                 reply = header + payload
+                self.log.debug("Successfully read %d byte payload", len(payload))
             except asyncio.IncompleteReadError as error:
                 self.log.error("Failed to read Modbus payload of %d bytes: %r", size, error)
+                self.log.error("Header was: %r", header)
                 raise
         else:
             reply = header
-        self.log.debug("received %r", reply)
+            self.log.debug("Zero-length payload, using header only")
+            
+        self.log.debug("received complete message (%d bytes): %r", len(reply), reply)
         return reply
 
     async def read(self):
@@ -131,6 +155,10 @@ class Connection:
                 self.log.debug("partial data received: %r", error.partial)
             else:
                 self.log.info("client closed connection")
+            await self.close()
+        except ValueError as error:
+            # Handle our custom ValueError for oversized messages
+            self.log.error("Protocol error: %r", error)
             await self.close()
         except Exception as error:
             self.log.error("reading error: %r", error)

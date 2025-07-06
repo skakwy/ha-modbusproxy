@@ -1,6 +1,6 @@
 name: "modbus-proxy"
 description: "Proxy for Accessing three modbus systems."
-version: "1.0.0"
+version: "1.0.1"
 slug: "modbus_proxy"
 arch:
   - aarch64
@@ -28,7 +28,7 @@ options:
   listenport3: 504
   connection_time3: 0.5
   timeout3: 15
-  loglevel: "INFO"
+  loglevel: "DEBUG"
 schema:
   upstreamhost: str
   upstreamport: int

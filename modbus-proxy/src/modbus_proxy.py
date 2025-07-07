@@ -66,6 +66,8 @@ class Connection:
         if self.writer is not None:
             self.log.debug("closing connection...")
             try:
+                # Give SMA devices time to finish their response
+                await asyncio.sleep(0.1)
                 self.writer.close()
                 await self.writer.wait_closed()
             except Exception as error:
@@ -77,9 +79,11 @@ class Connection:
                 self.writer = None
 
     async def _write(self, data):
-        self.log.debug("sending %r", data)
+        self.log.debug("sending %d bytes: %r", len(data), data)
         self.writer.write(data)
         await self.writer.drain()
+        # Small delay for SMA devices that need time to process requests
+        await asyncio.sleep(0.01)  # 10ms delay
 
     async def write(self, data):
         try:
@@ -91,11 +95,14 @@ class Connection:
         return True
 
     async def _read(self):
-        """Read ModBus TCP message"""
-        # TODO: Handle Modbus RTU and ASCII
+        """Read ModBus TCP message with improved SMA device compatibility"""
         try:
-            header = await self.reader.readexactly(6)
+            # Read header with timeout to prevent hanging
+            header = await asyncio.wait_for(self.reader.readexactly(6), timeout=5.0)
             self.log.debug("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
+        except asyncio.TimeoutError:
+            self.log.error("Timeout reading Modbus header")
+            raise
         except asyncio.IncompleteReadError as error:
             self.log.error("Failed to read Modbus header: %r", error)
             raise
@@ -105,7 +112,7 @@ class Connection:
             
         # Modbus TCP header structure:
         # Byte 0-1: Transaction ID
-        # Byte 2-3: Protocol ID (should be 0)  
+        # Byte 2-3: Protocol ID (should be 0, but SMA might use non-zero)  
         # Byte 4-5: Length field (number of bytes following)
         transaction_id = int.from_bytes(header[0:2], "big")
         protocol_id = int.from_bytes(header[2:4], "big") 
@@ -114,25 +121,54 @@ class Connection:
         self.log.debug("Modbus header - Transaction ID: %d, Protocol ID: %d, Length: %d", 
                       transaction_id, protocol_id, size)
         
-        # Validate the header looks reasonable
+        # SMA devices may use non-zero protocol IDs, so just warn instead of failing
         if protocol_id != 0:
-            self.log.warning("Unexpected protocol ID: %d (should be 0)", protocol_id)
+            self.log.debug("Non-standard protocol ID: %d (SMA device behavior)", protocol_id)
             
         # Size field includes unit identifier and function code onwards,
         # but excludes the 6-byte MBAP header, so we need to read (size) more bytes
         if size > 0:
-            # Add additional safety check for reasonable message size
-            # Modbus messages should not exceed 260 bytes (Modbus specification limit)
-            if size > 260:  
+            # SMA devices can send larger responses than standard Modbus
+            # Increase limit but still protect against obviously corrupted data
+            if size > 2048:  # Much more generous limit for SMA devices
                 self.log.error("Modbus message size too large: %d bytes. Full header: %r", size, header)
                 self.log.error("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
-                # This indicates stream corruption or misalignment - close connection
-                raise ValueError(f"Modbus message size exceeds specification limit: {size} bytes")
+                # Try to read available data to see if it's just a parsing issue
+                available_data = b""
+                try:
+                    # Try to read some data to see what's actually there
+                    available_data = await asyncio.wait_for(self.reader.read(min(size, 1024)), timeout=2.0)
+                    self.log.error("Available data sample: %s", " ".join(f"{b:02x}" for b in available_data[:50]))
+                except Exception as read_error:
+                    self.log.error("Could not read available data: %r", read_error)
+                raise ValueError(f"Modbus message size too large: {size} bytes")
                 
             try:
-                payload = await self.reader.readexactly(size)
+                # Use progressive reading for large payloads with timeout
+                if size > 256:
+                    self.log.debug("Large payload detected (%d bytes), using progressive read", size)
+                    payload = b""
+                    remaining = size
+                    while remaining > 0:
+                        chunk_size = min(remaining, 256)
+                        chunk = await asyncio.wait_for(
+                            self.reader.readexactly(chunk_size), 
+                            timeout=3.0
+                        )
+                        payload += chunk
+                        remaining -= len(chunk)
+                        self.log.debug("Read chunk: %d bytes, remaining: %d", len(chunk), remaining)
+                else:
+                    payload = await asyncio.wait_for(
+                        self.reader.readexactly(size), 
+                        timeout=3.0
+                    )
+                    
                 reply = header + payload
                 self.log.debug("Successfully read %d byte payload", len(payload))
+            except asyncio.TimeoutError:
+                self.log.error("Timeout reading Modbus payload of %d bytes", size)
+                raise
             except asyncio.IncompleteReadError as error:
                 self.log.error("Failed to read Modbus payload of %d bytes: %r", size, error)
                 self.log.error("Header was: %r", header)
@@ -141,7 +177,7 @@ class Connection:
             reply = header
             self.log.debug("Zero-length payload, using header only")
             
-        self.log.debug("received complete message (%d bytes): %r", len(reply), reply)
+        self.log.debug("received complete message (%d bytes)", len(reply))
         return reply
 
     async def read(self):
@@ -206,13 +242,15 @@ class ModBus(Connection):
                 self.log.info("delay after connect: %s", self.connection_time)
                 await asyncio.sleep(self.connection_time)
 
-    async def write_read(self, data, attempts=2):
+    async def write_read(self, data, attempts=3):  # Increased attempts for SMA
         async with self.lock:
             for i in range(attempts):
                 try:
                     await self.connect()
+                    self.log.debug("Attempt %d/%d: Sending request to modbus device", i + 1, attempts)
                     coro = self._write_read(data)
                     result = await asyncio.wait_for(coro, self.timeout)
+                    self.log.debug("Successfully got response from modbus device")
                     return result
                 except asyncio.IncompleteReadError as error:
                     self.log.error(
@@ -220,21 +258,35 @@ class ModBus(Connection):
                         i + 1, attempts, error, len(error.partial) if error.partial else 0, error.expected
                     )
                     await self.close()
-                    if i == attempts - 1:  # Last attempt
+                    if i < attempts - 1:  # Not the last attempt
+                        self.log.info("Retrying after incomplete read...")
+                        await asyncio.sleep(0.5)  # Wait before retry
+                    else:
                         raise
                 except asyncio.TimeoutError as error:
                     self.log.error(
                         "write_read timeout error [%s/%s]: %r", i + 1, attempts, error
                     )
                     await self.close()
-                    if i == attempts - 1:  # Last attempt
+                    if i < attempts - 1:  # Not the last attempt
+                        self.log.info("Retrying after timeout...")
+                        await asyncio.sleep(1.0)  # Longer wait after timeout
+                    else:
                         raise
+                except ValueError as error:
+                    # Protocol errors (like oversized messages) shouldn't be retried
+                    self.log.error("Protocol error, not retrying: %r", error)
+                    await self.close()
+                    raise
                 except Exception as error:
                     self.log.error(
                         "write_read error [%s/%s]: %r", i + 1, attempts, error
                     )
                     await self.close()
-                    if i == attempts - 1:  # Last attempt
+                    if i < attempts - 1:  # Not the last attempt
+                        self.log.info("Retrying after error...")
+                        await asyncio.sleep(0.3)
+                    else:
                         raise
 
     async def _write_read(self, data):
@@ -244,15 +296,29 @@ class ModBus(Connection):
     async def handle_client(self, reader, writer):
         async with Client(reader, writer) as client:
             while True:
+                # Read client request
                 request = await client.read()
                 if not request:
                     break
+                    
+                self.log.debug("Forwarding request to modbus device: %d bytes", len(request))
+                
+                # Forward to modbus device and get reply
                 reply = await self.write_read(request)
                 if not reply:
+                    self.log.error("No reply from modbus device")
                     break
+                    
+                self.log.debug("Got reply from modbus device: %d bytes", len(reply))
+                
+                # Send reply back to client
                 result = await client.write(reply)
                 if not result:
+                    self.log.error("Failed to send reply to client")
                     break
+                    
+                # Small delay to let SMA devices process the transaction
+                await asyncio.sleep(0.02)  # 20ms delay between transactions
 
     async def start(self):
         self.server = await asyncio.start_server(

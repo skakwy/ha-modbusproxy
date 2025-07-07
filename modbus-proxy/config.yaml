@@ -14,20 +14,20 @@ options:
   upstreamhost: "192.168.178.100"
   upstreamport: 502
   listenport: 502
-  connection_time: 0.5
-  timeout: 15
+  connection_time: 1.0
+  timeout: 30
   enablehost2: true
   upstreamhost2: "192.168.178.101"
   upstreamport2: 502
   listenport2: 503
-  connection_time2: 0.5
-  timeout2: 15
+  connection_time2: 1.0
+  timeout2: 30
   enablehost3: true
   upstreamhost3: "192.168.178.102"
   upstreamport3: 502
   listenport3: 504
-  connection_time3: 0.5
-  timeout3: 15
+  connection_time3: 1.0
+  timeout3: 30
   loglevel: "DEBUG"
 schema:
   upstreamhost: str

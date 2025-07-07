@@ -11,6 +11,7 @@ import pathlib
 import argparse
 import warnings
 import contextlib
+import socket
 import logging.config
 from urllib.parse import urlparse
 
@@ -97,6 +98,11 @@ class Connection:
     async def _read(self):
         """Read ModBus TCP message with improved SMA device compatibility"""
         try:
+            # Check if connection is still alive before reading
+            if self.reader.at_eof():
+                self.log.warning("Connection EOF detected before reading header")
+                raise ConnectionResetError("Connection closed by remote device")
+                
             # Read header with timeout to prevent hanging
             header = await asyncio.wait_for(self.reader.readexactly(6), timeout=5.0)
             self.log.debug("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
@@ -104,8 +110,12 @@ class Connection:
             self.log.error("Timeout reading Modbus header")
             raise
         except asyncio.IncompleteReadError as error:
-            self.log.error("Failed to read Modbus header: %r", error)
-            raise
+            if len(error.partial) == 0:
+                self.log.error("Connection closed by remote device (EOF)")
+                raise ConnectionResetError("Remote device closed connection")
+            else:
+                self.log.error("Failed to read Modbus header: %r", error)
+                raise
         except Exception as error:
             self.log.error("Error reading Modbus header: %r", error)
             raise
@@ -121,6 +131,20 @@ class Connection:
         self.log.debug("Modbus header - Transaction ID: %d, Protocol ID: %d, Length: %d", 
                       transaction_id, protocol_id, size)
         
+        # Enhanced validation for corrupted headers (like the 8239 byte issue)
+        if size > 2048:  # This catches the 8239 byte issue
+            self.log.error("Detected corrupted header - size too large: %d bytes (0x%04x)", size, size)
+            self.log.error("Full header: %r", header)
+            self.log.error("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
+            
+            # The 8239 bytes (0x2027) suggests stream misalignment
+            self.log.warning("Stream corruption detected - forcing reconnection to resync")
+            raise ConnectionResetError("Stream corruption detected - forcing reconnection")
+            
+        # Check for obviously invalid headers that might indicate stream corruption
+        if transaction_id == 0xFFFF or (transaction_id == 0 and protocol_id == 0 and size == 0):
+            self.log.warning("Suspicious header pattern detected, possible stream corruption")
+        
         # SMA devices may use non-zero protocol IDs, so just warn instead of failing
         if protocol_id != 0:
             self.log.debug("Non-standard protocol ID: %d (SMA device behavior)", protocol_id)
@@ -128,22 +152,12 @@ class Connection:
         # Size field includes unit identifier and function code onwards,
         # but excludes the 6-byte MBAP header, so we need to read (size) more bytes
         if size > 0:
-            # SMA devices can send larger responses than standard Modbus
-            # Increase limit but still protect against obviously corrupted data
-            if size > 2048:  # Much more generous limit for SMA devices
-                self.log.error("Modbus message size too large: %d bytes. Full header: %r", size, header)
-                self.log.error("Raw header bytes: %s", " ".join(f"{b:02x}" for b in header))
-                # Try to read available data to see if it's just a parsing issue
-                available_data = b""
-                try:
-                    # Try to read some data to see what's actually there
-                    available_data = await asyncio.wait_for(self.reader.read(min(size, 1024)), timeout=2.0)
-                    self.log.error("Available data sample: %s", " ".join(f"{b:02x}" for b in available_data[:50]))
-                except Exception as read_error:
-                    self.log.error("Could not read available data: %r", read_error)
-                raise ValueError(f"Modbus message size too large: {size} bytes")
-                
             try:
+                # Check for EOF before attempting to read payload
+                if self.reader.at_eof():
+                    self.log.error("Connection EOF detected before reading payload")
+                    raise ConnectionResetError("Connection closed by remote device before payload")
+                    
                 # Use progressive reading for large payloads with timeout
                 if size > 256:
                     self.log.debug("Large payload detected (%d bytes), using progressive read", size)
@@ -151,23 +165,45 @@ class Connection:
                     remaining = size
                     while remaining > 0:
                         chunk_size = min(remaining, 256)
-                        chunk = await asyncio.wait_for(
-                            self.reader.readexactly(chunk_size), 
-                            timeout=3.0
-                        )
+                        try:
+                            chunk = await asyncio.wait_for(
+                                self.reader.readexactly(chunk_size), 
+                                timeout=5.0  # Increased timeout for SMA
+                            )
+                        except asyncio.IncompleteReadError as error:
+                            if len(error.partial) == 0:
+                                self.log.error("Connection closed during progressive read (EOF)")
+                                raise ConnectionResetError("Remote device closed connection during read")
+                            else:
+                                raise
                         payload += chunk
                         remaining -= len(chunk)
                         self.log.debug("Read chunk: %d bytes, remaining: %d", len(chunk), remaining)
+                        
+                        # Check for EOF between chunks
+                        if remaining > 0 and self.reader.at_eof():
+                            self.log.error("Connection EOF detected during progressive read")
+                            raise ConnectionResetError("Connection closed during progressive read")
                 else:
-                    payload = await asyncio.wait_for(
-                        self.reader.readexactly(size), 
-                        timeout=3.0
-                    )
+                    try:
+                        payload = await asyncio.wait_for(
+                            self.reader.readexactly(size), 
+                            timeout=5.0  # Increased timeout for SMA
+                        )
+                    except asyncio.IncompleteReadError as error:
+                        if len(error.partial) == 0:
+                            self.log.error("Connection closed during payload read (EOF)")
+                            raise ConnectionResetError("Remote device closed connection during payload read")
+                        else:
+                            raise
                     
                 reply = header + payload
                 self.log.debug("Successfully read %d byte payload", len(payload))
             except asyncio.TimeoutError:
                 self.log.error("Timeout reading Modbus payload of %d bytes", size)
+                raise
+            except ConnectionResetError:
+                # Re-raise connection errors as-is
                 raise
             except asyncio.IncompleteReadError as error:
                 self.log.error("Failed to read Modbus payload of %d bytes: %r", size, error)
@@ -183,6 +219,9 @@ class Connection:
     async def read(self):
         try:
             return await self._read()
+        except ConnectionResetError as error:
+            self.log.error("Connection reset by SMA device: %r", error)
+            await self.close()
         except asyncio.IncompleteReadError as error:
             if error.partial:
                 self.log.error("reading error - incomplete read: %r (got %d bytes, expected %d)", 
@@ -190,7 +229,7 @@ class Connection:
                 # Log the partial data for debugging
                 self.log.debug("partial data received: %r", error.partial)
             else:
-                self.log.info("client closed connection")
+                self.log.info("client closed connection (EOF)")
             await self.close()
         except ValueError as error:
             # Handle our custom ValueError for oversized messages
@@ -230,17 +269,39 @@ class ModBus(Connection):
 
     async def open(self):
         self.log.info("connecting to modbus...")
-        self.reader, self.writer = await asyncio.open_connection(
-            self.modbus_host, self.modbus_port
-        )
-        self.log.info("connected!")
+        try:
+            # Use SO_KEEPALIVE for better connection stability with SMA devices
+            self.reader, self.writer = await asyncio.open_connection(
+                self.modbus_host, self.modbus_port
+            )
+            # Enable TCP keepalive for SMA device connections
+            sock = self.writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # Set keepalive parameters for better SMA compatibility
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, 'TCP_KEEPINTVL'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                if hasattr(socket, 'TCP_KEEPCNT'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            self.log.info("connected!")
+        except Exception as error:
+            self.log.error("Failed to connect to SMA device: %r", error)
+            raise
 
     async def connect(self):
         if not self.opened:
+            self.log.debug("Opening new connection to SMA device...")
             await asyncio.wait_for(self.open(), self.timeout)
             if self.connection_time > 0:
                 self.log.info("delay after connect: %s", self.connection_time)
                 await asyncio.sleep(self.connection_time)
+            # Additional check to ensure connection is stable for SMA devices
+            await asyncio.sleep(0.1)
+            if not self.opened:
+                self.log.error("Connection failed to stabilize")
+                raise ConnectionError("Failed to establish stable connection to SMA device")
 
     async def write_read(self, data, attempts=3):  # Increased attempts for SMA
         async with self.lock:
@@ -252,6 +313,17 @@ class ModBus(Connection):
                     result = await asyncio.wait_for(coro, self.timeout)
                     self.log.debug("Successfully got response from modbus device")
                     return result
+                except ConnectionResetError as error:
+                    self.log.error(
+                        "Connection reset by SMA device [%s/%s]: %r", 
+                        i + 1, attempts, error
+                    )
+                    await self.close()
+                    if i < attempts - 1:  # Not the last attempt
+                        self.log.info("Retrying after connection reset...")
+                        await asyncio.sleep(2.0)  # Longer wait for SMA device reset
+                    else:
+                        raise
                 except asyncio.IncompleteReadError as error:
                     self.log.error(
                         "write_read incomplete read error [%s/%s]: %r (got %d bytes, expected %d)", 
